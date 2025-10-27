@@ -106,7 +106,7 @@ protected function createBorgAdapter(array $config): FilesystemAdapter
 }
 ```
 
-3) Clear Panel caches:
+4) Clear Panel caches:
 ```bash
 php artisan config:clear
 php artisan optimize:clear
