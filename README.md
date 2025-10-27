@@ -63,7 +63,7 @@ It enables **creating, restoring, and deleting** backups with Borg, using a **pe
 use Pterodactyl\Models\Backup;
 
 return [
-    'default' => env('APP_BACKUP_DRIVER', 'borg'),
+    'default' => env('APP_BACKUP_DRIVER', Backup::ADAPTER_BORG),
 
     'presigned_url_lifespan' => env('BACKUP_PRESIGNED_URL_LIFESPAN', 60),
     'max_part_size' => env('BACKUP_MAX_PART_SIZE', 5 * 1024 * 1024 * 1024),
@@ -79,12 +79,25 @@ return [
         's3'    => [/* ... S3 config ... */],
 
         // New: treat 'borg' as a disk the Panel can orchestrate
-        'borg'  => ['adapter' => 'borg'],
+        'borg'  => ['adapter' => Backup::ADAPTER_BORG],
     ],
 ];
 ```
 
-2) `app/Extensions/Backups/BackupManager.php` — support the `borg` adapter by mapping it to `wings`:
+2) `/app/Models/backups.php` — Add the new adapter:
+```php
+class Backup extends Model
+{
+    use SoftDeletes;
+
+    public const RESOURCE_NAME = 'backup';
+
+    public const ADAPTER_WINGS = 'wings';
+    public const ADAPTER_AWS_S3 = 's3';
+    public const ADAPTER_BORG  = 'borg'; // Add the new adapter
+```
+
+3) `app/Extensions/Backups/BackupManager.php` — support the `borg` adapter by mapping it to `wings`:
 ```php
 protected function createBorgAdapter(array $config): FilesystemAdapter
 {
@@ -98,6 +111,7 @@ protected function createBorgAdapter(array $config): FilesystemAdapter
 php artisan config:clear
 php artisan optimize:clear
 php artisan queue:restart
+php artisan optimize
 ```
 
 ---
