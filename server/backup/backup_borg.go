@@ -22,13 +22,6 @@ import (
 	"github.com/pterodactyl/wings/server/filesystem"
 )
 
-//
-// ========= ENV =========
-// WINGS_BORG_REPOSITORY_ROOT (default: /var/lib/pterodactyl/backups/borg)
-// WINGS_BORG_PASSPHRASE_DIR  (default: /etc/pterodactyl/borg)
-// WINGS_BORG_ENCRYPTION_MODE (default: repokey-blake2)
-//
-
 func envOr(k, def string) string {
 	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 		return v
@@ -71,7 +64,7 @@ func (b *BorgBackup) WithLogContext(ctx map[string]interface{}) {
 	if ctx == nil {
 		b.logContext = map[string]interface{}{}
 	} else {
-		 b.logContext = ctx
+		b.logContext = ctx
 	}
 }
 
@@ -138,7 +131,7 @@ func (b *BorgBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, 
 
 	ad := ArchiveDetails{
 		ChecksumType: "borg",
-		Checksum:     b.Uuid,
+		Checksum:     b.Uuid, // el Panel mostrará "borg:<uuid>"
 	}
 	if sz, err := b.Size(); err == nil {
 		ad.Size = sz
@@ -206,11 +199,35 @@ func (b *BorgBackup) Restore(ctx context.Context, _ io.Reader, cb RestoreCallbac
 			return errors.WrapIf(waitErr, "borg extract failed: "+errb.String())
 		}
 	}
-
 	return nil
 }
 
-// ---------- Remove / Checksum / Size ----------
+// ---------- Export / Remove / Checksum / Size ----------
+
+// Exporta el backup como TAR.GZ a un writer (para descargas HTTP).
+func (b *BorgBackup) ExportTarGz(ctx context.Context, w io.Writer) error {
+	repo, passfile, err := b.resolveRepoAndPass()
+	if err != nil {
+		return err
+	}
+	repoArchive := fmt.Sprintf("%s::%s", repo, b.Uuid)
+	args := []string{"export-tar", "--tar-filter", "gzip -c", repoArchive, "-"}
+
+	cmd := exec.CommandContext(ctx, "borg", args...)
+	cmd.Env = append(os.Environ(),
+		"BORG_PASSPHRASE="+strings.TrimSpace(string(passFromFile(passfile))),
+		"BORG_RELOCATED_REPO_ACCESS_IS_OK=yes",
+	)
+	cmd.Stdout = w
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+
+	if err := cmd.Run(); err != nil {
+		return errors.WrapIf(err, "borg export-tar failed: "+errb.String())
+	}
+	return nil
+}
+
 func (b *BorgBackup) Remove() error {
 	repo, passfile, err := b.resolveRepoAndPass()
 	if err != nil {
@@ -244,10 +261,14 @@ func (b *BorgBackup) Size() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if info.Archive.DeduplicatedSize > 0 {
-		return info.Archive.DeduplicatedSize, nil
+	// <-- AHORA leemos archive.stats.*
+	if info.Archive.Stats.DeduplicatedSize > 0 {
+		return info.Archive.Stats.DeduplicatedSize, nil
 	}
-	return info.Archive.CompressedSize, nil
+	if info.Archive.Stats.CompressedSize > 0 {
+		return info.Archive.Stats.CompressedSize, nil
+	}
+	return 0, nil
 }
 
 // ============================= Helpers =============================
@@ -375,13 +396,17 @@ func (b *BorgBackup) archiveID(ctx context.Context, repo, backupUUID string, pas
 	return info.Archive.ID, nil
 }
 
+// *** FIX: ahora mapeamos archive.stats.*
 type borgInfo struct {
 	Archive struct {
-		ID               string  `json:"id"`
-		Name             string  `json:"name"`
-		Duration         float64 `json:"duration"`
-		CompressedSize   int64   `json:"compressed_size"`
-		DeduplicatedSize int64   `json:"deduplicated_size"`
+		ID       string  `json:"id"`
+		Name     string  `json:"name"`
+		Duration float64 `json:"duration"`
+		Stats    struct {
+			OriginalSize     int64 `json:"original_size"`
+			CompressedSize   int64 `json:"compressed_size"`
+			DeduplicatedSize int64 `json:"deduplicated_size"`
+		} `json:"stats"`
 	} `json:"archive"`
 }
 
@@ -430,7 +455,6 @@ func normalizeItemType(t string) string {
 	}
 }
 
-// Lista contenido del archive (json-lines con fallback a texto)
 func (b *BorgBackup) listFiles(ctx context.Context, repo, backupUUID string, pass []byte) ([]fileEntry, error) {
 	repoArchive := fmt.Sprintf("%s::%s", repo, backupUUID)
 
@@ -455,7 +479,6 @@ func (b *BorgBackup) listFiles(ctx context.Context, repo, backupUUID string, pas
 			if v, ok := obj["type"].(string); ok {
 				fe.Type = normalizeItemType(v)
 			}
-			// size
 			switch v := obj["size"].(type) {
 			case float64:
 				fe.Size = int64(v)
@@ -464,7 +487,6 @@ func (b *BorgBackup) listFiles(ctx context.Context, repo, backupUUID string, pas
 					fe.Size = n
 				}
 			}
-			// mode: puede venir como "0644" numérico o "-rw-r--r--" string
 			if v, ok := obj["mode"].(string); ok && fe.Mode == 0 {
 				if m, ok2 := parsePermString(v, fe.Type == "d"); ok2 {
 					fe.Mode = m
@@ -472,15 +494,14 @@ func (b *BorgBackup) listFiles(ctx context.Context, repo, backupUUID string, pas
 			} else if vv, ok := obj["mode"].(float64); ok {
 				fe.Mode = int(vv)
 			}
-			// mtime: RFC3339 o epoch
 			switch v := obj["mtime"].(type) {
-            case string:
-            	if ts, ok := parseBorgTimeToUnix(v); ok {
-            		fe.Mtime = ts
-            	}
-            case float64:
-            	fe.Mtime = int64(v)
-            }
+			case string:
+				if ts, ok := parseBorgTimeToUnix(v); ok {
+					fe.Mtime = ts
+				}
+			case float64:
+				fe.Mtime = int64(v)
+			}
 			files = append(files, fe)
 		}
 		return files, nil
@@ -514,12 +535,12 @@ func (b *BorgBackup) listFiles(ctx context.Context, repo, backupUUID string, pas
 			fe.Size = n
 		}
 		if n, e := strconv.ParseInt(parts[3], 10, 64); e == nil {
-        	fe.Mtime = n
-        } else {
-        	if ts, ok := parseBorgTimeToUnix(parts[3]); ok {
-        		fe.Mtime = ts
-        	}
-        }
+			fe.Mtime = n
+		} else {
+			if ts, ok := parseBorgTimeToUnix(parts[3]); ok {
+				fe.Mtime = ts
+			}
+		}
 		fe.Path = parts[4]
 		files = append(files, fe)
 	}
@@ -598,19 +619,18 @@ func relativizeForServerRoot(p, serverUUID string) string {
 	return p
 }
 
+// parsea mtime de borg (RFC3339 con o sin zona) o números (segundos)
 func parseBorgTimeToUnix(s string) (int64, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, false
 	}
-
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return n, true
 	}
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
 		return int64(f), true
 	}
-
 	layouts := []string{
 		time.RFC3339Nano,
 		"2006-01-02T15:04:05.999999999Z07:00",
@@ -623,7 +643,6 @@ func parseBorgTimeToUnix(s string) (int64, bool) {
 			return t.Unix(), true
 		}
 	}
-	
 	if !strings.ContainsAny(s, "Z+-") {
 		if t, err := time.Parse("2006-01-02T15:04:05.999999999Z07:00", s+"Z"); err == nil {
 			return t.Unix(), true
